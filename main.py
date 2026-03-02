@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from scipy.signal import butter, filtfilt, find_peaks
+from scipy.signal import butter, filtfilt, find_peaks, windows
 
 # ─── vital_sqi imports ──────────────────────────────────────────────
 from vital_sqi.preprocess.preprocess_signal import smooth_signal, taper_signal
@@ -63,7 +63,7 @@ warnings.filterwarnings("ignore")
 # ════════════════════════════════════════════════════════════════════
 # 0. Load & inspect raw data (bypass PPG_reader for correct sampling rate)
 # ════════════════════════════════════════════════════════════════════
-file_in = os.path.abspath("Raw_data.csv")
+file_in = os.path.abspath("/Users/lijiye/coding/zig_bt_client/Raw_data.csv")
 
 # Read CSV directly — PPG_reader's calculate_sampling_rate uses min(diff)
 # which picks up timestamp jitter (1ms) → bogus 1001 Hz
@@ -108,9 +108,7 @@ print("\n" + "─" * 70)
 print("1. Signal Preprocessing")
 print("─" * 70)
 
-# Step 1a: Bandpass filter (0.5 – 5 Hz) — isolate PPG heart rate band
-# No need to manually remove DC offset — bandpass inherently rejects DC (0 Hz)
-# Using 5 Hz highcut (not 8 Hz) to match PPG physiological range (0.5-4 Hz)
+# Step 1a: Bandpass filter (0.5 – 5 Hz) — isolate PPG heart rate band using scipy
 lowcut, highcut = 0.5, 5.0
 nyq = 0.5 * sampling_rate
 b, a = butter(4, [lowcut / nyq, highcut / nyq], btype="band")
@@ -118,17 +116,18 @@ filtered_signal = filtfilt(b, a, raw_signal)
 print(f"  [1a] Bandpass      : {lowcut}–{highcut} Hz, 4th order Butterworth")
 print(f"       Filtered range: [{filtered_signal.min():.2f}, {filtered_signal.max():.2f}]")
 
-# Step 1c: Smoothing (Hanning window)
-smoothed_signal = smooth_signal(filtered_signal, window_len=5, window="hanning")
-smoothed_signal = smoothed_signal[:N]
-print(f"  [1b] Smoothing     : Hanning window, len=5")
+# Step 1c: Smoothing — Optional mild smoothing to reduce high-frequency noise without distortion
+window_len = 5
+hanning_window = np.hanning(window_len)
+smoothed_signal = np.convolve(filtered_signal, hanning_window / hanning_window.sum(), mode='same')
+print(f"  [1b] Smoothing     : Hanning window, len={window_len} (scipy convolve)")
 
-# Step 1d: Tapering (for template matching)
-tapered_signal = taper_signal(smoothed_signal)
-print(f"  [1c] Tapering      : Tukey window (for DTW template matching)")
+# Step 1d: Tapering — Optional tapering using a simple Tukey window 
+tapered_signal = smoothed_signal * windows.tukey(N, alpha=0.1)
+print(f"  [1c] Tapering      : Tukey window (scipy)")
 
 # The main processed signal for analysis
-processed_signal = filtered_signal
+processed_signal = smoothed_signal
 
 # Preprocessing quality checks
 snr_check = np.std(processed_signal) / np.std(processed_signal - smoothed_signal) if np.std(processed_signal - smoothed_signal) > 0 else float('inf')
@@ -186,7 +185,7 @@ standard_results = {}
 standard_results["Kurtosis"] = kurtosis_sqi(processed_signal)
 standard_results["Skewness"] = skewness_sqi(processed_signal)
 standard_results["Entropy"] = entropy_sqi(processed_signal)
-standard_results["SNR"] = signal_to_noise_sqi(processed_signal)
+standard_results["SNR"] = signal_to_noise_sqi(raw_signal)
 standard_results["Perfusion Index (%)"] = perfusion_sqi(raw_signal, processed_signal)
 standard_results["Zero Crossing Rate"] = zero_crossings_rate_sqi(processed_signal)
 standard_results["Mean Crossing Rate"] = mean_crossing_rate_sqi(processed_signal)
@@ -198,74 +197,20 @@ for name, val in standard_results.items():
 # 3. Peak Detection
 # ════════════════════════════════════════════════════════════════════
 print("\n" + "─" * 70)
-print("3. Peak Detection")
+print("3. Peak Detection (Scipy)")
 print("─" * 70)
 
-detector = PeakDetector(wave_type="ppg", fs=sampling_rate)
+# Detect valleys (troughs) by finding peaks in the inverted signal to use as primary fiducials
+# Set minimum distance to 0.3s (max heart rate ~ 200 bpm)
+min_dist = int(sampling_rate * 0.3)
+peaks, _ = find_peaks(-processed_signal, distance=min_dist, prominence=np.std(processed_signal)*0.5)
 
-# Try multiple detectors and pick the best result
-detector_types = {
-    1: "Adaptive Threshold",
-    2: "Count Orig",
-    3: "Clusterer",
-    4: "Slope Sum",
-    5: "Moving Average",
-    6: "Scipy Default",
-    7: "Billauer",
-}
+# Detect actual physical peaks
+troughs, _ = find_peaks(processed_signal, distance=min_dist, prominence=np.std(processed_signal)*0.5)
 
-def _score_detector(p, t, sr, label):
-    """Score a peak detector result by physiological plausibility."""
-    n_peaks, n_troughs = len(p), len(t)
-    score, hr_est = 0, 0
-    if n_peaks > 2:
-        rr_ms = np.diff(p) * (1000 / sr)
-        hr_est = 60000 / np.mean(rr_ms)
-        rr_cv = np.std(rr_ms) / np.mean(rr_ms) if np.mean(rr_ms) > 0 else 999
-        # Continuous HR scoring: ideal range 50-150 bpm, penalize deviation
-        if 50 <= hr_est <= 150:
-            score += 100
-        elif 40 <= hr_est <= 180:
-            score += 70
-        elif 30 <= hr_est <= 200:
-            score += 30
-        # Bonus for troughs (needed for DTW, beat extraction)
-        if n_troughs > 0:
-            score += 20
-        # Lower RR variability = more consistent detection
-        score += max(0, 30 - rr_cv * 30)
-        score += min(n_peaks / 10, 5)
-    status = f"HR≈{hr_est:.0f}bpm, score={score:.0f}" if n_peaks > 2 else "too few"
-    print(f"    {label:30s}: {n_peaks} peaks, {n_troughs} troughs ({status})")
-    return score, hr_est
-
-best_peaks, best_troughs, best_name, best_score = [], [], "None", -1
-print("  Trying multiple peak detectors:")
-
-# vital_sqi detectors
-for dt_id, dt_name in detector_types.items():
-    try:
-        p, t = detector.ppg_detector(processed_signal, detector_type=dt_id)
-        score, _ = _score_detector(p, t, sampling_rate, f"[{dt_id}] {dt_name}")
-        if score > best_score:
-            best_peaks, best_troughs, best_name, best_score = list(p), list(t), dt_name, score
-    except Exception as e:
-        print(f"    [{dt_id}] {dt_name:25s}: Error - {e}")
-
-# Additional: scipy find_peaks with physiological min distance
-# Min distance = 0.3s (max 200 bpm), find both peaks and troughs
-min_dist = int(sampling_rate * 0.3)  # 200 bpm max
-sp_peaks, _ = find_peaks(processed_signal, distance=min_dist)
-sp_troughs, _ = find_peaks(-processed_signal, distance=min_dist)
-score, _ = _score_detector(sp_peaks, sp_troughs, sampling_rate, "[+] Scipy find_peaks (d=0.3s)")
-if score > best_score:
-    best_peaks, best_troughs, best_name, best_score = list(sp_peaks), list(sp_troughs), "Scipy find_peaks", score
-
-peaks = np.array(best_peaks)
-troughs = np.array(best_troughs)
-print(f"\n  ✓ Best detector : {best_name}")
-print(f"  Peaks detected  : {len(peaks)}")
-print(f"  Troughs detected: {len(troughs)}")
+print(f"  ✓ Best detector : Scipy find_peaks (using valleys, d={min_dist/sampling_rate:.2f}s)")
+print(f"  Valleys detected (used as peaks): {len(peaks)}")
+print(f"  Peaks detected (used as troughs): {len(troughs)}")
 
 rr_intervals = np.array([])
 if len(peaks) > 1:
@@ -577,14 +522,14 @@ for seg_idx in range(n_segments):
     seg_result["kurtosis"] = kurtosis_sqi(seg)
     seg_result["skewness"] = skewness_sqi(seg)
     seg_result["entropy"] = entropy_sqi(seg)
-    seg_result["snr"] = signal_to_noise_sqi(seg)
+    seg_result["snr"] = signal_to_noise_sqi(raw_signal[start:end])
     seg_result["zcr"] = zero_crossings_rate_sqi(seg)
     seg_result["mcr"] = mean_crossing_rate_sqi(seg)
     seg_result["perfusion"] = perfusion_sqi(raw_signal[start:end], seg)
 
-    # Peak-based per segment
+    # Valley-based per segment
     try:
-        seg_peaks, seg_troughs = detector.ppg_detector(seg, detector_type=1)
+        seg_peaks, _ = find_peaks(-seg, distance=min_dist, prominence=np.std(seg)*0.5)
         seg_result["n_peaks"] = len(seg_peaks)
         if len(seg_peaks) > 2:
             seg_rr = np.diff(seg_peaks) * (1000 / sampling_rate)
@@ -640,10 +585,10 @@ ax2 = fig.add_subplot(gs[1, :])
 ax2.plot(time_axis, processed_signal, linewidth=0.8, color="steelblue", label="Filtered PPG")
 if len(peaks) > 0:
     ax2.scatter(np.array(peaks) / sampling_rate, processed_signal[peaks],
-                color="red", s=20, zorder=5, label=f"Peaks ({len(peaks)})")
+                color="red", s=20, zorder=5, label=f"Valleys ({len(peaks)})")
 if len(troughs) > 0:
     ax2.scatter(np.array(troughs) / sampling_rate, processed_signal[troughs],
-                color="green", s=15, zorder=5, label=f"Troughs ({len(troughs)})")
+                color="green", s=15, zorder=5, label=f"Peaks ({len(troughs)})")
 ax2.set_title("Peak Detection Results", fontsize=14, fontweight="bold")
 ax2.set_xlabel("Time (s)")
 ax2.set_ylabel("Amplitude")

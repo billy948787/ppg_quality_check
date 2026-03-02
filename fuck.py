@@ -5,7 +5,7 @@ from scipy.signal import butter, filtfilt
 
 # 1. 讀取資料
 # 注意：CSV 標頭可能有空格，將其去除
-df = pd.read_csv('Raw_data.csv')
+df = pd.read_csv('/Users/lijiye/coding/zig_bt_client/Raw_data.csv')
 df.columns = df.columns.str.strip()
 
 # 取得 raw signal
