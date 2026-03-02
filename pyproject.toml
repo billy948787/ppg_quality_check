@@ -1,0 +1,10 @@
+[project]
+name = "ppg-quality-check"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "nolds==0.5.2",
+    "vital-sqi>=0.1.0",
+]
