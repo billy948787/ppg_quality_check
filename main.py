@@ -63,15 +63,55 @@ warnings.filterwarnings("ignore")
 # ════════════════════════════════════════════════════════════════════
 # 0. Load & inspect raw data (bypass PPG_reader for correct sampling rate)
 # ════════════════════════════════════════════════════════════════════
-file_in = os.path.abspath("/Users/lijiye/coding/zig_bt_client/Raw_data.csv")
+file_in = os.path.abspath("Raw_data.csv")
 
 # Read CSV directly — PPG_reader's calculate_sampling_rate uses min(diff)
 # which picks up timestamp jitter (1ms) → bogus 1001 Hz
 df_raw = pd.read_csv(file_in)
 df_raw.columns = df_raw.columns.str.strip()
 
-raw_signal = df_raw["data"].values.astype(float)
-timestamps_ms = df_raw["timestamp"].values.astype(float)
+# Try to adapt to different CSV formats (Raw_data.csv vs s17_run.csv)
+if "pleth_3" in df_raw.columns:
+    raw_signal = df_raw["pleth_3"].values.astype(float)
+elif "data" in df_raw.columns:
+    raw_signal = df_raw["data"].values.astype(float)
+else:
+    raise ValueError("Could not find signal data column. Expected 'pleth_3' or 'data'.")
+
+if "time" in df_raw.columns:
+    time_col = df_raw["time"]
+elif "timestamp" in df_raw.columns:
+    time_col = df_raw["timestamp"]
+else:
+    raise ValueError("Could not find timestamp column. Expected 'time' or 'timestamp'.")
+
+# Parse timestamps
+if np.issubdtype(time_col.dtype, np.number):
+    timestamps_numeric = time_col.values.astype(float)
+    # Infer scale based on typical magnitude
+    # A typical ms timestamp is ~ 1.6e12 (13 digits)
+    # A typical us timestamp is ~ 1.6e15 (16 digits)
+    # A typical ns timestamp is ~ 1.6e18 (19 digits)
+    mean_ts = np.nanmean(timestamps_numeric)
+    if mean_ts > 1e17:  # Nanoseconds
+        timestamps_ms = timestamps_numeric / 1e6
+        print("  [Data Load] Detected nanosecond timestamps. Converting to ms.")
+    elif mean_ts > 1e14:  # Microseconds
+        timestamps_ms = timestamps_numeric / 1000.0
+        print("  [Data Load] Detected microsecond timestamps. Converting to ms.")
+    else: # Milliseconds or Seconds (if seconds, let's treat 1e10 range as threshold)
+        if mean_ts < 1e10: # Seconds
+             timestamps_ms = timestamps_numeric * 1000.0
+             print("  [Data Load] Detected second timestamps. Converting to ms.")
+        else:
+             timestamps_ms = timestamps_numeric
+             print("  [Data Load] Detected millisecond timestamps.")
+else:
+    # If it's a string like '2021-01-01 12:49:32.211466', convert to datetime then ms
+    dt = pd.to_datetime(time_col)
+    # Convert to relative milliseconds from the start to match existing logic
+    timestamps_ms = (dt - dt.iloc[0]).dt.total_seconds().values * 1000.0
+    print("  [Data Load] Parsed string datetimes to relative ms.")
 
 # Compute duration and detect timestamp issues
 ts_diffs_ms = np.diff(timestamps_ms)
@@ -109,7 +149,7 @@ print("1. Signal Preprocessing")
 print("─" * 70)
 
 # Step 1a: Bandpass filter (0.5 – 5 Hz) — isolate PPG heart rate band using scipy
-lowcut, highcut = 0.5, 5.0
+lowcut, highcut = 0.5, 2.5
 nyq = 0.5 * sampling_rate
 b, a = butter(4, [lowcut / nyq, highcut / nyq], btype="band")
 filtered_signal = filtfilt(b, a, raw_signal)
@@ -202,11 +242,11 @@ print("─" * 70)
 
 # Detect valleys (troughs) by finding peaks in the inverted signal to use as primary fiducials
 # Set minimum distance to 0.3s (max heart rate ~ 200 bpm)
-min_dist = int(sampling_rate * 0.3)
-peaks, _ = find_peaks(-processed_signal, distance=min_dist, prominence=np.std(processed_signal)*0.5)
+min_dist = int(sampling_rate * 0.5)
+peaks, _ = find_peaks(-processed_signal, distance=min_dist, prominence=np.std(processed_signal)*0.75)
 
 # Detect actual physical peaks
-troughs, _ = find_peaks(processed_signal, distance=min_dist, prominence=np.std(processed_signal)*0.5)
+troughs, _ = find_peaks(processed_signal, distance=min_dist, prominence=np.std(processed_signal)*0.75)
 
 print(f"  ✓ Best detector : Scipy find_peaks (using valleys, d={min_dist/sampling_rate:.2f}s)")
 print(f"  Valleys detected (used as peaks): {len(peaks)}")
@@ -713,7 +753,7 @@ print("  Report saved to: ppg_analysis_report.png")
 plt.show()
 
 # ════════════════════════════════════════════════════════════════════
-# Summary
+# Summary & Rule-Based Quality Classification
 # ════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 70)
 print("ANALYSIS COMPLETE")
@@ -725,12 +765,153 @@ except NameError:
     pass
 print(f"  Total metrics computed: {total_metrics}")
 print(f"  Segments analyzed    : {n_segments}")
-print(f"  Signal quality       : ", end="")
 
-# Simple quality assessment based on key metrics
-if standard_results.get("SNR", 0) > 5 and standard_results.get("Kurtosis", 0) > 0:
-    print("GOOD ✓")
-elif standard_results.get("SNR", 0) > 2:
-    print("FAIR ⚠")
-else:
-    print("POOR ✗")
+# ── Rule/RuleSet 多指標質量評估 ─────────────────────────────────
+from vital_sqi.rule import Rule, RuleSet
+
+def make_range_rule(name, low, high):
+    """Accept values in [low, high), reject outside. Covers -inf to +inf."""
+    r = Rule(name)
+    r.update_def(
+        op_list=["<", ">", ">=", "<"],
+        value_list=[low, low, high, high],
+        label_list=["reject", "accept", "reject", "accept"]
+    )
+    return r
+
+def make_gt_rule(name, threshold):
+    """Accept values > threshold, reject <= threshold."""
+    r = Rule(name)
+    r.update_def(
+        op_list=["<", ">"],
+        value_list=[threshold, threshold],
+        label_list=["reject", "accept"]
+    )
+    return r
+
+def make_lt_rule(name, threshold):
+    """Accept values < threshold, reject >= threshold."""
+    r = Rule(name)
+    r.update_def(
+        op_list=["<", ">"],
+        value_list=[threshold, threshold],
+        label_list=["accept", "reject"]
+    )
+    return r
+
+# --- 嚴格規則集 (通過 = GOOD) ---
+strict_rules = {
+    1: make_range_rule("Skewness",           -0.26, 0.87),
+    2: make_range_rule("Kurtosis",           -1.25, 1.17),
+    3: make_gt_rule("SNR",                   2),
+    4: make_gt_rule("Perfusion",             0.5),
+    5: make_range_rule("Zero-Crossing-Rate", 0.03, 0.07),
+    6: make_range_rule("Mean-Crossing-Rate", 0.02, 0.07),
+}
+
+# --- 寬鬆規則集 (通過 = FAIR, 不通過 = POOR) ---
+loose_rules = {
+    1: make_range_rule("Skewness",           -1.0, 2.0),
+    2: make_range_rule("Kurtosis",           -2.0, 3.0),
+    3: make_gt_rule("SNR",                   0),
+    4: make_gt_rule("Perfusion",             0.05),
+    5: make_range_rule("Zero-Crossing-Rate", 0.01, 0.15),
+    6: make_range_rule("Mean-Crossing-Rate", 0.01, 0.15),
+}
+
+# 加入 R-peak 相關規則 (如果有數據)
+rule_idx = len(strict_rules)
+if rpeak_results.get("MSQ (Multi-Detector)") is not None:
+    rule_idx += 1
+    strict_rules[rule_idx] = make_gt_rule("MSQ", 0.5)
+    loose_rules[rule_idx]  = make_gt_rule("MSQ", 0.27)
+
+if rpeak_results.get("Ectopic Ratio (Malik)") is not None:
+    rule_idx += 1
+    strict_rules[rule_idx] = make_lt_rule("Ectopic", 0.1)
+    loose_rules[rule_idx]  = make_lt_rule("Ectopic", 0.3)
+
+if hr_results.get("HR Out-of-Range (%, 40-200)") is not None:
+    rule_idx += 1
+    strict_rules[rule_idx] = make_lt_rule("HR-Range", 5)
+    loose_rules[rule_idx]  = make_lt_rule("HR-Range", 20)
+
+strict_ruleset = RuleSet(strict_rules)
+loose_ruleset  = RuleSet(loose_rules)
+
+def evaluate_quality(sqi_row, strict_rs, loose_rs):
+    """三級分類: GOOD / FAIR / POOR"""
+    try:
+        if strict_rs.execute(sqi_row) == "accept":
+            return "GOOD ✓"
+    except:
+        pass
+    try:
+        if loose_rs.execute(sqi_row) == "accept":
+            return "FAIR ⚠"
+    except:
+        pass
+    return "POOR ✗"
+
+# 建立全局 SQI DataFrame
+global_sqi = {
+    "Skewness":           standard_results.get("Skewness", 0),
+    "Kurtosis":           standard_results.get("Kurtosis", 0),
+    "SNR":                standard_results.get("SNR", 0),
+    "Perfusion":          standard_results.get("Perfusion Index (%)", 0),
+    "Zero-Crossing-Rate": standard_results.get("Zero Crossing Rate", 0),
+    "Mean-Crossing-Rate": standard_results.get("Mean Crossing Rate", 0),
+}
+if rpeak_results.get("MSQ (Multi-Detector)") is not None:
+    global_sqi["MSQ"] = rpeak_results["MSQ (Multi-Detector)"]
+if rpeak_results.get("Ectopic Ratio (Malik)") is not None:
+    global_sqi["Ectopic"] = rpeak_results["Ectopic Ratio (Malik)"]
+if hr_results.get("HR Out-of-Range (%, 40-200)") is not None:
+    global_sqi["HR-Range"] = hr_results["HR Out-of-Range (%, 40-200)"]
+
+global_sqi_df = pd.DataFrame([global_sqi])
+overall_quality = evaluate_quality(global_sqi_df, strict_ruleset, loose_ruleset)
+
+print(f"\n  Signal Quality (Rule-Based): {overall_quality}")
+print(f"  ── Rules used: {len(strict_rules)} SQI metrics")
+print(f"     Skewness={global_sqi['Skewness']:.3f}  Kurtosis={global_sqi['Kurtosis']:.3f}  "
+      f"SNR={global_sqi['SNR']:.3f}")
+print(f"     Perfusion={global_sqi['Perfusion']:.3f}  ZCR={global_sqi['Zero-Crossing-Rate']:.3f}  "
+      f"MCR={global_sqi['Mean-Crossing-Rate']:.3f}")
+if "MSQ" in global_sqi:
+    print(f"     MSQ={global_sqi['MSQ']:.3f}", end="")
+if "Ectopic" in global_sqi:
+    print(f"  Ectopic={global_sqi['Ectopic']:.3f}", end="")
+if "HR-Range" in global_sqi:
+    print(f"  HR-OOR={global_sqi['HR-Range']:.1f}%", end="")
+if any(k in global_sqi for k in ["MSQ", "Ectopic", "HR-Range"]):
+    print()
+
+# ── 每段 Segment 質量分類 ──────────────────────────────────────
+print(f"\n  ── Per-Segment Quality ──")
+seg_qualities = []
+for seg in segment_sqis:
+    seg_sqi = {
+        "Skewness":           seg.get("skewness", 0),
+        "Kurtosis":           seg.get("kurtosis", 0),
+        "SNR":                seg.get("snr", 0),
+        "Perfusion":          seg.get("perfusion", 0),
+        "Zero-Crossing-Rate": seg.get("zcr", 0),
+        "Mean-Crossing-Rate": seg.get("mcr", 0),
+    }
+    # Segment 級別只用統計指標
+    seg_strict = RuleSet({k: v for k, v in strict_rules.items() if k <= 6})
+    seg_loose  = RuleSet({k: v for k, v in loose_rules.items() if k <= 6})
+
+    seg_df = pd.DataFrame([seg_sqi])
+    sq_quality = evaluate_quality(seg_df, seg_strict, seg_loose)
+    seg_qualities.append(sq_quality)
+    print(f"     Segment {seg['segment']:2d} [{seg['start_s']:.0f}s–{seg['end_s']:.0f}s]: {sq_quality}")
+
+good_count = sum(1 for q in seg_qualities if "GOOD" in q)
+fair_count = sum(1 for q in seg_qualities if "FAIR" in q)
+poor_count = sum(1 for q in seg_qualities if "POOR" in q)
+print(f"\n  Summary: {good_count} GOOD / {fair_count} FAIR / {poor_count} POOR "
+      f"(out of {len(seg_qualities)} segments)")
+print(f"  Usable segments: {good_count + fair_count}/{len(seg_qualities)} "
+      f"({100*(good_count+fair_count)/max(len(seg_qualities),1):.0f}%)")
