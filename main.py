@@ -25,7 +25,7 @@ def _parse_args() -> argparse.Namespace:
         description="PPG Signal Quality Analysis",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("file", nargs="?", default="s17_run.csv", help="CSV file to analyse")
+    p.add_argument("file", help="CSV file to analyse")
     p.add_argument(
         "--no-show", action="store_true", help="Do not display plots interactively"
     )
